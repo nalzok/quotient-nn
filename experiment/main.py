@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import MNIST
 import torchvision.transforms as T
 
-from .train import create_train_state, train_step, cross_replica_mean, test_step
+from .train import create_train_state, train_step, cross_replica_mean, scale_step
 
 
 def cli():
@@ -17,11 +17,15 @@ def cli():
     parser.add_argument('--batch_size', type=int)
     parser.add_argument('--epochs', type=int)
     parser.add_argument('--learning_rate', type=float)
+    parser.add_argument('--scaling_epochs', type=int)
+    parser.add_argument('--scaling_rate', type=float)
     args = parser.parse_args()
 
     batch_size = args.batch_size
     epochs = args.epochs
     learning_rate = args.learning_rate
+    scaling_epochs = args.scaling_epochs
+    scaling_rate = args.scaling_rate
 
     device_count = jax.local_device_count()
     assert batch_size % device_count == 0, f'batch_size should be divisible by {device_count}'
@@ -35,37 +39,54 @@ def cli():
     ])
 
     train_dataset = MNIST(root, train=True, download=True, transform=transform)
-    test_dataset = MNIST(root, train=False, download=True, transform=transform)
 
     key = jax.random.PRNGKey(42)
-    key_init, key = jax.random.split(key)
     num_classes = 10
-    state = create_train_state(key_init, num_classes, learning_rate, specimen)
-    state = replicate(state)
 
 
-    print('===> Training')
+    print('===> Training Alice')
+    key_init, key = jax.random.split(key)
+    alice = create_train_state(key_init, num_classes, learning_rate, specimen)
+    alice = replicate(alice)
     train_loader = DataLoader(train_dataset, batch_size)
     for epoch in range(epochs):
-        state, loss = train_epoch(state, device_count, train_loader)
+        alice, loss = train_epoch(alice, device_count, train_loader)
         with jnp.printoptions(precision=3):
             print(f'Epoch {epoch + 1}, train loss: {loss}')
 
     # Sync the batch statistics across replicas so that evaluation is deterministic.
-    state = state.replace(batch_stats=cross_replica_mean(state.batch_stats))
+    alice = alice.replace(batch_stats=cross_replica_mean(alice.batch_stats))
 
 
-    print('===> Testing')
-    for dataset_name, dataset in [
-            ('Train', train_dataset),
-            ('Test', test_dataset)]:
-        test_loader = DataLoader(dataset, batch_size)
-        hits = test_epoch(state, device_count, test_loader)
-
+    print('===> Training Bob')
+    key_init, key = jax.random.split(key)
+    bob = create_train_state(key_init, num_classes, learning_rate, specimen)
+    bob = replicate(bob)
+    train_loader = DataLoader(train_dataset, batch_size)
+    for epoch in range(epochs):
+        bob, loss = train_epoch(bob, device_count, train_loader)
         with jnp.printoptions(precision=3):
-            total = len(dataset)
-            accuracy = hits/total
-            print(f'{dataset_name} accuracy: {accuracy}')
+            print(f'Epoch {epoch + 1}, train loss: {loss}')
+
+    # Sync the batch statistics across replicas so that evaluation is deterministic.
+    bob = bob.replace(batch_stats=cross_replica_mean(bob.batch_stats))
+
+
+    print('===> Scaling')
+    alice_factor = {
+        'params': jax.tree_util.tree_map(lambda _: 0., alice.params),
+        'batch_stats': jax.tree_util.tree_map(lambda _: 0., alice.batch_stats),
+    }
+    bob_factor = {
+        'params': jax.tree_util.tree_map(lambda _: 0., bob.params),
+        'batch_stats': jax.tree_util.tree_map(lambda _: 0., bob.batch_stats),
+    }
+    factors = replicate((alice_factor, bob_factor))
+    for epoch in range(scaling_epochs):
+        key_scale, key = jax.random.split(key)
+        factors, loss = scale_epoch(factors, key_scale, alice, bob, scaling_rate, device_count, train_loader)
+        with jnp.printoptions(precision=3):
+            print(f'Epoch {epoch + 1}, scale loss: {loss}')
 
 
 def train_epoch(state, device_count, loader):
@@ -85,9 +106,9 @@ def train_epoch(state, device_count, loader):
     return state, epoch_loss
 
 
-def test_epoch(state, device_count, test_loader):
-    hits = 0
-    for X, y in test_loader:
+def scale_epoch(factors, key, alice, bob, scaling_rate, device_count, loader):
+    epoch_loss = 0
+    for X, y in loader:
         remainder = X.shape[0] % device_count
         if remainder != 0:
             X = X[:-remainder]
@@ -96,9 +117,11 @@ def test_epoch(state, device_count, test_loader):
         image = jnp.array(X).reshape(device_count, -1, *X.shape[1:])
         label = jnp.array(y).reshape(device_count, -1, *y.shape[1:])
 
-        hits += test_step(state, image, label).sum()
+        key_scale, key = jax.random.split(key)
+        factors, loss = scale_step(factors, replicate(key_scale), alice, bob, scaling_rate, image, label)
+        epoch_loss += loss.sum()
 
-    return hits
+    return factors, epoch_loss
 
 
 if __name__ == '__main__':

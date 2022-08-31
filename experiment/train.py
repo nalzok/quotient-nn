@@ -1,4 +1,4 @@
-from typing import Any, Callable, Tuple
+from typing import Union, Any, Callable, Tuple
 from functools import partial
 
 import jax
@@ -8,6 +8,9 @@ from flax.training import train_state
 import optax
 
 from .resnet import ResNet18
+
+
+PyTree = Union[flax.core.frozen_dict.FrozenDict, jnp.ndarray]
 
 
 class TrainState(train_state.TrainState):
@@ -62,3 +65,42 @@ def test_step(state: TrainState, image: jnp.ndarray, label: jnp.ndarray) -> jnp.
     hit = jnp.sum(prediction == label)
 
     return hit
+
+
+def scale(factor: PyTree, state: TrainState) -> TrainState:
+    params = jax.tree_util.tree_map(lambda x, y: jnp.exp(x) * y, factor['params'], state.params)
+    batch_stats = jax.tree_util.tree_map(lambda x, y: jnp.exp(x) * y, factor['batch_stats'], state.batch_stats)
+    state = state.replace(params=params, batch_stats=batch_stats)
+    return state
+
+
+def interpolate(epsilon, x, y):
+    interpolated = jax.tree_util.tree_map(lambda u, v: epsilon * u + (1-epsilon) * v, x, y)
+    return interpolated
+
+
+@partial(jax.pmap, axis_name='batch', static_broadcasted_argnums=(4,), donate_argnums=(0,))
+def scale_step(factors: PyTree, key: Any, alice: TrainState, bob: TrainState, scaling_rate: jnp.ndarray,
+        image: jnp.ndarray, label: jnp.ndarray) -> Tuple[PyTree, jnp.ndarray]:
+    @jax.value_and_grad
+    def loss_fn(factors: PyTree) -> jnp.ndarray:
+        alice_factor, bob_factor = factors
+        alice_scaled = scale(alice_factor, alice)
+        bob_scaled = scale(bob_factor, bob)
+
+        epsilon = jax.random.uniform(key)
+        variables = {
+            'params': interpolate(epsilon, alice_scaled.params, bob_scaled.params),
+            'batch_stats': interpolate(epsilon, alice_scaled.batch_stats, bob_scaled.batch_stats)
+        }
+        logits = alice.apply_fn(variables, image, False)
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits, label)
+
+        return loss.sum()
+
+    loss, grads = loss_fn(factors)
+    grads = jax.lax.psum(grads, axis_name='batch')
+
+    factors = jax.tree_util.tree_map(lambda x, y: x - scaling_rate * y, factors, grads)
+
+    return factors, loss
