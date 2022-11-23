@@ -3,7 +3,7 @@ import argparse
 import jax
 import jax.numpy as jnp
 from jax.experimental.compilation_cache.compilation_cache import initialize_cache
-from flax.jax_utils import replicate
+from flax.jax_utils import replicate, unreplicate
 import torch
 from torch.utils.data import DataLoader
 from torchvision.datasets import MNIST
@@ -73,20 +73,17 @@ def cli():
 
 
     print('===> Scaling')
-    alice_factor = {
+    factor = {
         'params': jax.tree_util.tree_map(lambda _: 0., alice.params),
         'batch_stats': jax.tree_util.tree_map(lambda _: 0., alice.batch_stats),
     }
-    bob_factor = {
-        'params': jax.tree_util.tree_map(lambda _: 0., bob.params),
-        'batch_stats': jax.tree_util.tree_map(lambda _: 0., bob.batch_stats),
-    }
-    factors = replicate((alice_factor, bob_factor))
+    factor = replicate(factor)
     for epoch in range(scaling_epochs):
         key_scale, key = jax.random.split(key)
-        factors, loss = scale_epoch(factors, key_scale, alice, bob, scaling_rate, device_count, train_loader)
+        factor, loss = scale_epoch(factor, key_scale, alice, bob, scaling_rate, device_count, train_loader)
         with jnp.printoptions(precision=3):
             print(f'Epoch {epoch + 1}, scale loss: {loss}')
+            print(f'{unreplicate(factor)}')
 
 
 def train_epoch(state, device_count, loader):
@@ -106,7 +103,7 @@ def train_epoch(state, device_count, loader):
     return state, epoch_loss
 
 
-def scale_epoch(factors, key, alice, bob, scaling_rate, device_count, loader):
+def scale_epoch(factor, key, alice, bob, scaling_rate, device_count, loader):
     epoch_loss = 0
     for X, y in loader:
         remainder = X.shape[0] % device_count
@@ -118,10 +115,10 @@ def scale_epoch(factors, key, alice, bob, scaling_rate, device_count, loader):
         label = jnp.array(y).reshape(device_count, -1, *y.shape[1:])
 
         key_scale, key = jax.random.split(key)
-        factors, loss = scale_step(factors, replicate(key_scale), alice, bob, scaling_rate, image, label)
+        factor, loss = scale_step(factor, replicate(key_scale), alice, bob, scaling_rate, image, label)
         epoch_loss += loss.sum()
 
-    return factors, epoch_loss
+    return factor, epoch_loss
 
 
 if __name__ == '__main__':
